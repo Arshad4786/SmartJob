@@ -8,7 +8,6 @@
 **Embedding Model Selection & Trade-offs**
 
 ![API Deployment Proof](assets/screenshot-health.png)
-*(Note: Save your Vercel health check screenshot as `screenshot-health.png` in an `assets` folder)*
 
 For the initial semantic ranking phase, I selected the **Cohere API**, specifically utilizing the `embed-english-v3.0` model. 
 
@@ -22,7 +21,6 @@ When designing the architecture, my primary alternative was deploying a local, o
 **Tool-Calling Flow**
 
 ![Agentic Reasoning Output](assets/screenshot-reasoning.png)
-*(Note: Save your UI screenshot showing the Match Score and explanations here)*
 
 The agentic layer utilizes Groq’s `llama-3.3-70b-versatile` model, interacting exclusively through native JSON tool-calling rather than prompt chaining. The flow is decoupled into two distinct stages:
 
@@ -41,7 +39,6 @@ The primary failure mode of this design is external API latency. Any rate-limiti
 ### 3. Honest Weaknesses
 
 ![500 Server Error Debugging](assets/screenshot-500-error.png)
-*(Note: Save your Vercel 500 Error logs screenshot here to show debugging experience)*
 
 **Handling Noisy Resumes**
 The system currently relies on basic text extraction (like `PyPDF2`) to parse candidate uploads. This approach strips out visual hierarchies, tables, and layout context. If a candidate uploads a highly graphical, multi-column resume, the text extraction will yield scrambled, fragmented strings. This "garbage-in" data will confuse the Groq extraction tool and result in a highly inaccurate Cohere semantic embedding, destroying the match quality.
@@ -57,7 +54,6 @@ Due to time limits, I skipped implementing an advanced Document AI parser (like 
 ### 4. Next Steps
 
 ![Dynamic Clarifying Question](assets/screenshot-question.png)
-*(Note: Save your UI screenshot showing the Refine/Clarifying Question box here)*
 
 If I had two more days, the single improvement with the highest impact would be integrating a dedicated **Vector Database** (such as Pinecone, Milvus, or Qdrant). 
 
