@@ -1,112 +1,64 @@
-# Technical Write-up: Smart Job Match Agent
+# Smart Job Match Agent: Technical Write-up
+**Applicant:** Arshad Ajij Shaikh| D.J. Sanghvi College of Engineering  
+**Project:** Cantilever AI Engineering Intern Assignment  
 
-## 1. Design Choices
+---
 
-### Embedding Model Selection
-I chose the `all-MiniLM-L6-v2` model from the sentence-transformers library for the semantic similarity component. This model provides an excellent balance of performance and efficiency:
-- **Performance**: Generates 384-dimensional embeddings that capture semantic meaning effectively
-- **Speed**: Relatively lightweight (~80MB) with fast inference times
-- **Open-source**: No API dependencies or costs, making it suitable for local development and deployment
-- **Quality**: Performs well on semantic similarity tasks despite its small size
+### 1. Design Choices
+**Embedding Model Selection & Trade-offs**
 
-### Alternatives Considered and Rejected:
-1. **OpenAI text-embedding-3-small**: Higher quality embeddings but requires API key, incurs costs, and introduces network latency
-2. **all-mpnet-base-v2**: Better accuracy (768-dim) but significantly slower and larger (~420MB)
-3. **paraphrase-MiniLM-L6-v2**: Similar size but optimized for paraphrase detection rather than general semantic similarity
-4. **Domain-specific models**: Considered but rejected due to the diverse range of job domains in the dataset
+![API Deployment Proof](assets/screenshot-health.png)
+*(Note: Save your Vercel health check screenshot as `screenshot-health.png` in an `assets` folder)*
 
-### Trade-offs Made:
-- **Accuracy vs Speed**: Selected MiniLM for faster iteration during development; could upgrade to larger model for production
-- **Local vs API**: Chose open-source model to avoid external dependencies and costs
-- **Simplicity vs Sophistication**: Used cosine similarity on sentence embeddings rather than more complex ranking approaches like cross-encoders
+For the initial semantic ranking phase, I selected the **Cohere API**, specifically utilizing the `embed-english-v3.0` model. 
 
-## 2. Agentic Architecture
+When designing the architecture, my primary alternative was deploying a local, open-source model using the `sentence-transformers` library (such as `all-MiniLM-L6-v2`). However, deploying a machine learning backend to a serverless environment like Vercel introduces severe hardware constraints, most notably the strict 1024 MB memory limit on the free tier. Loading a local embedding model directly into the FastAPI application memory space risks persistent Out-Of-Memory (OOM) crashes. Furthermore, serverless environments suffer from cold starts; loading a local ML model into memory on the first request would easily introduce 2–5 seconds of latency, risking Vercel’s execution timeouts.
 
-### Tool-Calling Flow
-The agent implements a two-step process using the LLM's native function/tool calling API:
+**The Trade-off:** I explicitly traded local execution (which avoids network latency and API dependency) for cloud-based memory safety and execution speed. By offloading the heavy vectorization to Cohere, the Vercel backend only has to handle a highly efficient NumPy dot product operation to calculate cosine similarity. This guarantees the serverless function executes rapidly, remaining well under Vercel’s 60-second timeout while avoiding the 1024 MB memory ceiling entirely.
 
-```
-Resume Text → [Resume Parser Tool] → Structured Candidate Info
-                                                      ↓
-Job Embeddings + Similarity Ranking → Top-5 Matches → [Match Reasoning Tool] → Natural Language Explanations
-                                                      ↓
-Candidate Info + Matches → [Question Generator] → Clarifying Question
-```
+---
 
-### Why Two Tool Calls Instead of One Large Prompt?
-1. **Separation of Concerns**: 
-   - Resume parsing focuses on information extraction
-   - Match reasoning focuses on explanatory generation
-   - Each tool has a single, well-defined responsibility
+### 2. Agentic Architecture
+**Tool-Calling Flow**
 
-2. **Independent Development and Testing**:
-   - Each tool can be developed, tested, and improved separately
-   - Easier to swap implementations (e.g., different parsing strategies)
+![Agentic Reasoning Output](assets/screenshot-reasoning.png)
+*(Note: Save your UI screenshot showing the Match Score and explanations here)*
 
-3. **Better Error Handling**:
-   - Failures in one step don't necessarily corrupt the other
-   - Can provide granular error messages (e.g., "parsing failed" vs "reasoning failed")
+The agentic layer utilizes Groq’s `llama-3.3-70b-versatile` model, interacting exclusively through native JSON tool-calling rather than prompt chaining. The flow is decoupled into two distinct stages:
 
-4. **Token Efficiency**:
-   - Smaller, focused prompts for each tool
-   - Reduced risk of prompt length exceeding model limits
+1. **Extraction (`extract_candidate_info`):** The raw resume string is passed to the LLM bound to a strict JSON schema. The tool forces the LLM to output structured data: name, skills, experience_years, preferred_roles, and education.
+2. **Ranking (Classical ML):** The extracted text is embedded via Cohere and compared against the pre-embedded `jobs.json` dataset using cosine similarity to find the top 5 matches.
+3. **Reasoning (`provide_match_reasoning`):** The structured candidate profile and the top 5 matched jobs are passed to a second tool. This tool forces the LLM to generate targeted, 2-3 sentence evaluations comparing the specific skills of the candidate against the requirements of the job.
 
-5. **Reusability**:
-   - Resume parser could be used in other contexts (profile building, etc.)
-   - Match reasoning tool could be adapted for other matching domains
+**Why split into two tools?**
+I split this into two distinct tool calls to maintain strict data integrity and prevent context window bloating. If a single monolithic prompt attempted to parse the resume, perform keyword comparisons, and write reasoning simultaneously, the LLM would be highly susceptible to hallucination—often outputting malformed JSON or inventing skills. Decoupling ensures the mathematical vector search is grounded in cleanly extracted data *before* any qualitative reasoning occurs.
 
-### Failure Modes of the Agent Design:
-1. **Tool Call Failures**: If the LLM fails to invoke a tool properly, the pipeline breaks
-2. **Inconsistent Outputs**: Tools might return unexpected formats requiring validation
-3. **Error Propagation**: Poor parsing leads to poor reasoning (garbage in, garbage out)
-4. **Latency**: Each tool call adds network round-trip time (if using remote LLM)
-5. **Tool Selection Errors**: LLM might choose wrong tool or invoke incorrectly
+**Failure Modes:**
+The primary failure mode of this design is external API latency. Any rate-limiting or network degradation from the Groq or Cohere APIs will cause the FastAPI server to hang, eventually triggering a 500 Internal Server Error when Vercel drops the connection. Additionally, if the LLM encounters a highly abstract, unreadable resume format, it may fail to bind to the `extract_candidate_info` JSON schema correctly, triggering a Pydantic validation exception.
 
-## 3. Honest Weaknesses
+---
 
-### Noisy or Poorly Written Resumes:
-- **Parsing Issues**: The current heuristic-based parser struggles with unconventional layouts
-- **Skill Extraction**: May miss skills mentioned in non-standard ways or acronyms
-- **Experience Detection**: Regex-based experience extraction fails with complex phrasing
-- **Name Extraction**: Assumes name appears at document start in specific format
+### 3. Honest Weaknesses
 
-### Scale Limitations (10,000+ Concurrent Requests):
-- **Memory Usage**: Current implementation loads all job embeddings into memory
-- **Compute Bottleneck**: Embedding generation happens per request (could be cached)
-- **No Batching**: Processes requests sequentially rather than in batches
-- **No Caching**: Resume embeddings aren't cached for repeated similar queries
-- **Single-threaded**: FastAPI with Uvicorn workers would help but has limits
+![500 Server Error Debugging](assets/screenshot-500-error.png)
+*(Note: Save your Vercel 500 Error logs screenshot here to show debugging experience)*
 
-### Corners Cut Due to Time:
-1. **Mock LLM Implementation**: Used rule-based simulations instead of actual LLM tool calls
-2. **Simple Explanations**: Generated explanations are rule-based rather than LLM-generated
-3. **Basic Parsing**: Resume parser uses keyword matching instead of NER/NLP models
-4. **Limited Question Generation**: Clarifying questions use heuristics rather than LLM creativity
-5. **No Persistence**: No caching or database for storing intermediate results
-6. **Minimal Error Handling**: Basic HTTP exceptions without detailed error categorization
-7. **No Async Processing**: Embedding computation blocks the request thread
+**Handling Noisy Resumes**
+The system currently relies on basic text extraction (like `PyPDF2`) to parse candidate uploads. This approach strips out visual hierarchies, tables, and layout context. If a candidate uploads a highly graphical, multi-column resume, the text extraction will yield scrambled, fragmented strings. This "garbage-in" data will confuse the Groq extraction tool and result in a highly inaccurate Cohere semantic embedding, destroying the match quality.
 
-## 4. Next Steps
+**Breaking at Scale (10,000 Concurrent Requests)**
+At scale, this architecture would break at the similarity computation layer. Currently, the cosine similarity is calculated in-memory using `np.dot` over the parsed `jobs.json` array. While O(N) linear time is highly performant for 50 jobs, executing 10,000 concurrent matrix multiplications in-memory for thousands of job listings would instantly exhaust Vercel's CPU and 1024 MB RAM limit, causing cascading server crashes.
 
-### Single Highest Impact Improvement:
-**Implement actual LLM tool calls with a production provider (e.g., OpenAI or Anthropic)** to replace the mock implementations in the agent.
+**Corners Cut:**
+Due to time limits, I skipped implementing an advanced Document AI parser (like AWS Textract) capable of reading visual resume layouts. I also bypassed implementing a persistent caching layer (like Redis) for the job embeddings, meaning the system redundantly recalculates identical job descriptions instead of pulling them from a cache.
 
-### Why This Would Have the Highest Impact:
-1. **Authentic Agentic Behavior**: Would transform the system from simulating tool use to actually using it
-2. **Improved Parsing Quality**: LLMs excel at extracting structured information from unstructured text
-3. **Better Explanations**: Natural language explanations would be more nuanced and context-aware
-4. **Enhanced Question Generation**: LLMs can generate more insightful, personalized follow-up questions
-5. **Foundation for Expansion**: Proper tool use enables adding more sophisticated capabilities:
-   - Skill gap analysis
-   - Career path suggestions
-   - Salary expectation guidance
-   - Interview preparation tips
+---
 
-### Implementation Approach:
-1. **Integrate with LLM API**: Use OpenAI's function calling or Anthropic's tool use
-2. **Define Proper Tool Schemas**: Create JSON schemas for resume_parser and match_reasoning tools
-3. **Implement Tool Handlers**: Actual functions that the LLM can call
-4. **Add Error Handling**: Proper fallback mechanisms for tool call failures
-5. **Maintain Interface**: Keep the same external API so the rest of the system remains unchanged
+### 4. Next Steps
 
-This improvement would directly address the core requirement of the assignment: building a truly agentic LLM layer that uses tool calling rather than simulating it with monolithic prompts.
+![Dynamic Clarifying Question](assets/screenshot-question.png)
+*(Note: Save your UI screenshot showing the Refine/Clarifying Question box here)*
+
+If I had two more days, the single improvement with the highest impact would be integrating a dedicated **Vector Database** (such as Pinecone, Milvus, or Qdrant). 
+
+Currently, reading `jobs.json` into memory and running NumPy math on every POST request is a severe architectural bottleneck that prevents scaling. Migrating the job embeddings to a persistent Vector DB would shift the heavy computational lifting off the Vercel server and enable Approximate Nearest Neighbor (ANN) search. This would drop retrieval latency to sub-milliseconds, solve the memory limit constraints, and allow the platform to instantly scale to handle hundreds of thousands of concurrent users and millions of job listings without degrading performance.
